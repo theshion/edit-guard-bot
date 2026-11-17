@@ -1,4 +1,4 @@
-"""Edit Guard Bot - edit protection, media auto-delete, NSFW filter and group moderation."""
+"""Edit Guard Bot - edit protection, content control, NSFW filter and group moderation."""
 import asyncio
 import html
 import logging
@@ -37,6 +37,7 @@ log = logging.getLogger("editguard")
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 NSFW_THRESHOLD = float(os.environ.get("NSFW_THRESHOLD", "0.5"))
 MAX_DELAY = 48 * 3600
+LOG_RETENTION = 48 * 3600  # how long message IDs are remembered for /purgeuser
 NSFW_CLASSES = {
     "FEMALE_BREAST_EXPOSED",
     "FEMALE_GENITALIA_EXPOSED",
@@ -44,7 +45,7 @@ NSFW_CLASSES = {
     "ANUS_EXPOSED",
     "BUTTOCKS_EXPOSED",
 }
-DEFAULT_WELCOME = "👋 Welcome {name} to {group}!"
+DEFAULT_WELCOME = "Hey {name}, welcome to {group}. Glad you're here!"
 
 # ----------------------------------------------------------------- database
 db = sqlite3.connect(DB_PATH, isolation_level=None)
@@ -63,6 +64,12 @@ db.executescript(
         PRIMARY KEY(chat_id, message_id));
     CREATE TABLE IF NOT EXISTS warns(
         chat_id INTEGER, user_id INTEGER, reason TEXT, ts REAL);
+    CREATE TABLE IF NOT EXISTS blocklist(
+        chat_id INTEGER, term TEXT, PRIMARY KEY(chat_id, term));
+    CREATE TABLE IF NOT EXISTS msglog(
+        chat_id INTEGER, message_id INTEGER, user_id INTEGER, ts REAL,
+        PRIMARY KEY(chat_id, message_id));
+    CREATE INDEX IF NOT EXISTS msglog_user ON msglog(chat_id, user_id);
     """
 )
 # Per-group settings. New columns are added automatically to existing databases.
@@ -76,6 +83,10 @@ CHAT_COLUMNS = {
     "nsfw_scope": "TEXT DEFAULT 'user'",
     "antilink": "INTEGER DEFAULT 0",
     "antiforward": "INTEGER DEFAULT 0",
+    "lock_files": "INTEGER DEFAULT 0",
+    "lock_videos": "INTEGER DEFAULT 0",
+    "lock_audio": "INTEGER DEFAULT 0",
+    "lock_channels": "INTEGER DEFAULT 0",
     "warn_limit": "INTEGER DEFAULT 3",
     "warn_action": "TEXT DEFAULT 'mute'",
     "welcome_on": "INTEGER DEFAULT 0",
@@ -111,6 +122,10 @@ def warn_count(chat_id: int, user_id: int) -> int:
     return db.execute(
         "SELECT COUNT(*) FROM warns WHERE chat_id=? AND user_id=?", (chat_id, user_id)
     ).fetchone()[0]
+
+
+def blocked_terms(chat_id: int) -> list:
+    return [r["term"] for r in db.execute("SELECT term FROM blocklist WHERE chat_id=?", (chat_id,))]
 
 
 def schedule(chat_id: int, message_id: int, delay: int, kind: str, mention: str = "") -> None:
@@ -155,7 +170,7 @@ def parse_duration(text: str):
 
 def fmt_duration(sec: int) -> str:
     if not sec:
-        return "instant"
+        return "immediately"
     out = []
     for name, size in (("d", 86400), ("h", 3600), ("m", 60), ("s", 1)):
         if sec >= size:
@@ -195,9 +210,9 @@ async def is_admin(context, chat_id: int, user_id: int) -> bool:
 
 
 async def sender_info(msg, context):
-    """-> (sender_id, is_admin). Anonymous admins / channel posts count as admin."""
+    """-> (sender_id, is_admin). Anonymous admins post as the group itself."""
     if msg.sender_chat:
-        return msg.sender_chat.id, True
+        return msg.sender_chat.id, msg.sender_chat.id == msg.chat_id
     return msg.from_user.id, await is_admin(context, msg.chat_id, msg.from_user.id)
 
 
@@ -228,16 +243,21 @@ async def delete(bot, chat_id: int, message_id: int) -> bool:
         return False
 
 
+async def bulk_delete(bot, chat_id: int, ids: list) -> None:
+    for i in range(0, len(ids), 100):
+        await bot.delete_messages(chat_id, ids[i : i + 100])
+
+
 async def reply(msg, text: str, markup=None):
     return await msg.reply_text(
         text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=markup
     )
 
 
-EDIT_NOTICE = "⚠️ {}, your message was deleted because you edited it."
-NSFW_NOTICE = "🔞 {}, your message was deleted because it contained NSFW content."
-LINK_NOTICE = "🔗 {}, links are not allowed in this group."
-FORWARD_NOTICE = "↪️ {}, forwarded messages are not allowed in this group."
+EDIT_NOTICE = "✏️ {} — edited messages aren't kept in this chat, so yours was removed."
+NSFW_NOTICE = "🔞 {} — that media was flagged as explicit and has been removed."
+LOCK_NOTICE = "🔒 {} — {} are switched off in this chat. Your message was removed."
+BLOCK_NOTICE = "⛔ {} — your message matched this chat's blocklist and was removed."
 
 
 # --------------------------------------------------------------- NSFW check
@@ -287,12 +307,76 @@ async def is_nsfw(msg) -> bool:
             os.remove(path)
 
 
+# ---------------------------------------------------------- content control
+LINK_TYPES = (MessageEntityType.URL, MessageEntityType.TEXT_LINK)
+
+
+def has_link(msg) -> bool:
+    entities = list(msg.entities or ()) + list(msg.caption_entities or ())
+    return any(e.type in LINK_TYPES for e in entities)
+
+
+# name -> (settings column, button label, plural noun for notices, test)
+LOCKS = {
+    "links": ("antilink", "🔗 Links", "links", has_link),
+    "forwards": ("antiforward", "↪️ Forwards", "forwarded messages", lambda m: bool(m.forward_origin)),
+    "files": ("lock_files", "📁 Files", "file uploads", lambda m: bool(m.document and not m.animation)),
+    "videos": ("lock_videos", "🎬 Videos", "videos", lambda m: bool(m.video or m.video_note)),
+    "audio": ("lock_audio", "🎵 Audio", "audio and voice messages", lambda m: bool(m.audio or m.voice)),
+    "channels": ("lock_channels", "📢 Channel posts", "posts sent as a channel", None),
+}
+
+
+def searchable_text(msg) -> str:
+    """Everything a blocklist term can match: text, caption, file names, forward source."""
+    parts = [msg.text, msg.caption]
+    for media in (msg.document, msg.video, msg.audio):
+        parts.append(getattr(media, "file_name", None))
+        parts.append(getattr(media, "title", None))
+    origin = msg.forward_origin
+    if origin:
+        src = getattr(origin, "chat", None) or getattr(origin, "sender_chat", None)
+        parts += [getattr(src, "title", None), getattr(src, "username", None)]
+    return " ".join(p for p in parts if p).casefold()
+
+
+def content_violation(msg, s, terms):
+    """-> notice template args for the first lock or blocklist rule the message breaks."""
+    for name, (column, _, noun, test) in LOCKS.items():
+        if test and s[column] and test(msg):
+            return LOCK_NOTICE, noun
+    if terms:
+        haystack = searchable_text(msg)
+        if any(t in haystack for t in terms):
+            return BLOCK_NOTICE, None
+    return None
+
+
+async def enforce_content(msg, s, context, terms) -> bool:
+    """Delete the message if it breaks a lock or the blocklist. True when removed."""
+    hit = content_violation(msg, s, terms)
+    if not hit:
+        return False
+    template, noun = hit
+    if await delete(context.bot, msg.chat_id, msg.message_id):
+        who = mention_of(msg)
+        await notify(context.bot, msg.chat_id, template.format(who, noun) if noun else template.format(who))
+    return True
+
+
 # --------------------------------------------------------- message handlers
-async def track_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remember usernames (for @username lookups) and recent message IDs (for /purgeuser)."""
     u = update.effective_user
     if u and u.username:
         db.execute(
             "INSERT OR REPLACE INTO users VALUES(?,?,?)", (u.username.lower(), u.id, u.first_name)
+        )
+    m = update.message
+    if m and m.chat.type in ("group", "supergroup") and (m.sender_chat or m.from_user):
+        uid = m.sender_chat.id if m.sender_chat else m.from_user.id
+        db.execute(
+            "INSERT OR REPLACE INTO msglog VALUES(?,?,?,?)", (m.chat_id, m.message_id, uid, time.time())
         )
 
 
@@ -314,24 +398,18 @@ async def on_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _seen_edits[key] = msg.edit_date
 
     s = settings(msg.chat_id)
-    if not s["edit_on"]:
-        return
     uid, admin = await sender_info(msg, context)
-    if (admin and s["edit_scope"] == "user") or is_authed(msg.chat_id, uid, "edit"):
+    trusted = is_authed(msg.chat_id, uid, "edit")
+    if s["edit_on"] and not trusted and not (admin and s["edit_scope"] == "user"):
+        mention = mention_of(msg)
+        if s["edit_delay"] > 0:
+            schedule(msg.chat_id, msg.message_id, s["edit_delay"], "edit", mention)
+        elif await delete(context.bot, msg.chat_id, msg.message_id):
+            await notify(context.bot, msg.chat_id, EDIT_NOTICE.format(mention))
         return
-    mention = mention_of(msg)
-    if s["edit_delay"] > 0:
-        schedule(msg.chat_id, msg.message_id, s["edit_delay"], "edit", mention)
-    elif await delete(context.bot, msg.chat_id, msg.message_id):
-        await notify(context.bot, msg.chat_id, EDIT_NOTICE.format(mention))
-
-
-LINK_TYPES = (MessageEntityType.URL, MessageEntityType.TEXT_LINK)
-
-
-def has_link(msg) -> bool:
-    entities = list(msg.entities or ()) + list(msg.caption_entities or ())
-    return any(e.type in LINK_TYPES for e in entities)
+    # The edit is allowed to stay - make sure it didn't sneak in restricted content.
+    if not admin and not trusted:
+        await enforce_content(msg, s, context, blocked_terms(msg.chat_id))
 
 
 def is_media(msg) -> bool:
@@ -346,22 +424,22 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or msg.is_automatic_forward:
         return
     s = settings(msg.chat_id)
-    media = is_media(msg)
-    if not (s["antilink"] or s["antiforward"] or (media and (s["nsfw"] or s["media_delay"]))):
-        return
-    uid, admin = await sender_info(msg, context)
     bot, chat_id = context.bot, msg.chat_id
+    media = is_media(msg)
+    terms = blocked_terms(chat_id)
+    locks_on = any(s[column] for column, *_ in LOCKS.values())
+    if not (locks_on or terms or (media and (s["nsfw"] or s["media_delay"]))):
+        return
 
-    # Locks apply to regular members only; /auth users are trusted.
+    if s["lock_channels"] and msg.sender_chat and msg.sender_chat.id != chat_id:
+        if await delete(bot, chat_id, msg.message_id):
+            await notify(bot, chat_id, LOCK_NOTICE.format(mention_of(msg), LOCKS["channels"][2]))
+        return
+
+    uid, admin = await sender_info(msg, context)
+    # Locks and the blocklist apply to regular members; trusted users are skipped.
     if not admin and not is_authed(chat_id, uid, "edit"):
-        notice = None
-        if s["antiforward"] and msg.forward_origin:
-            notice = FORWARD_NOTICE
-        elif s["antilink"] and has_link(msg):
-            notice = LINK_NOTICE
-        if notice:
-            if await delete(bot, chat_id, msg.message_id):
-                await notify(bot, chat_id, notice.format(mention_of(msg)))
+        if await enforce_content(msg, s, context, terms):
             return
 
     if not media or is_authed(chat_id, uid, "media"):
@@ -383,7 +461,7 @@ def render_welcome(s, user, chat_title: str) -> str:
 
 def rules_button(context, chat_id: int):
     url = f"https://t.me/{context.bot.username}?start=rules_{chat_id}"
-    return InlineKeyboardMarkup([[Btn("📜 Read the rules", url=url)]])
+    return InlineKeyboardMarkup([[Btn("📜 Group rules", url=url)]])
 
 
 async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -394,9 +472,9 @@ async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await notify(
                 context.bot,
                 msg.chat_id,
-                "👋 <b>Thanks for adding me!</b>\n"
-                "Make me an admin with <i>Delete messages</i> and <i>Ban users</i> permissions, "
-                "then send /settings to configure this group.",
+                "<b>Thanks for the invite.</b>\n"
+                "To get started, promote me to admin with <i>Delete messages</i>, "
+                "<i>Ban users</i> and <i>Pin messages</i>, then run /settings.",
                 ttl=0,
             )
         elif s["welcome_on"] and not user.is_bot:
@@ -412,9 +490,14 @@ async def on_leave(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await delete(context.bot, msg.chat_id, msg.message_id)
 
 
+_last_prune = 0.0
+
+
 async def sweep(context: ContextTypes.DEFAULT_TYPE):
     """Runs every few seconds: delete everything whose timer has expired."""
-    rows = db.execute("SELECT * FROM pending WHERE due<=?", (time.time(),)).fetchall()
+    global _last_prune
+    now = time.time()
+    rows = db.execute("SELECT * FROM pending WHERE due<=?", (now,)).fetchall()
     for r in rows:
         db.execute(
             "DELETE FROM pending WHERE chat_id=? AND message_id=?", (r["chat_id"], r["message_id"])
@@ -422,13 +505,16 @@ async def sweep(context: ContextTypes.DEFAULT_TYPE):
         ok = await delete(context.bot, r["chat_id"], r["message_id"])
         if ok and r["kind"] == "edit":
             await notify(context.bot, r["chat_id"], EDIT_NOTICE.format(r["mention"]))
+    if now - _last_prune > 3600:
+        _last_prune = now
+        db.execute("DELETE FROM msglog WHERE ts<?", (now - LOG_RETENTION,))
 
 
 # --------------------------------------------------------- command plumbing
 def group_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_chat.type == "private":
-            await reply(update.effective_message, "ℹ️ This command only works in groups.")
+            await reply(update.effective_message, "This command is meant for group chats.")
             return
         await func(update, context)
 
@@ -440,7 +526,7 @@ def admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, admin = await sender_info(update.effective_message, context)
         if not admin:
-            await reply(update.effective_message, "🚫 This command is for group admins only.")
+            await reply(update.effective_message, "This command is reserved for chat admins.")
             return
         await func(update, context)
 
@@ -468,8 +554,9 @@ def resolve_target(msg, args):
 
 
 NO_TARGET = (
-    "ℹ️ Reply to the user's message, or pass their user ID or @username.\n"
-    "<i>A @username only works after I have seen that user send a message.</i>"
+    "<b>Who should this apply to?</b>\n"
+    "Reply to one of their messages, or add their user ID or @username after the command.\n"
+    "<i>Usernames resolve only for people I've already seen in a chat.</i>"
 )
 
 
@@ -486,8 +573,9 @@ def take_duration(args):
 async def fail(msg, error: TelegramError):
     await reply(
         msg,
-        f"❌ I couldn't do that: <code>{html.escape(str(error))}</code>\n"
-        "Please check that I am an admin with the required permissions.",
+        "<b>That didn't go through.</b>\n"
+        f"Telegram said: <code>{html.escape(str(error))}</code>\n"
+        "Usually this means I'm missing an admin permission for this action.",
     )
 
 
@@ -500,13 +588,15 @@ def _delay_command(key: str, name: str, on_text: str, off_text: str):
         if sec is None or sec > MAX_DELAY:
             await reply(
                 msg,
-                f"<b>Usage:</b> <code>/{name} 2 minute</code>\n"
-                "Accepted: <code>30 sec</code>, <code>10m</code>, <code>1 hour</code>, "
-                "<code>1h 30m</code>, <code>0</code> / <code>off</code> (max 48h)",
+                f"<b>How to use /{name}</b>\n"
+                f"<code>/{name} 2m</code> — set a delay\n"
+                f"<code>/{name} off</code> — remove the delay\n\n"
+                "Time can be written as <code>30s</code>, <code>10m</code>, <code>1h 30m</code> "
+                "and so on, up to 48 hours.",
             )
             return
         set_setting(msg.chat_id, key, sec)
-        await reply(msg, "✅ " + (on_text.format(fmt_duration(sec)) if sec else off_text))
+        await reply(msg, on_text.format(fmt_duration(sec)) if sec else off_text)
 
     return handler
 
@@ -514,14 +604,14 @@ def _delay_command(key: str, name: str, on_text: str, off_text: str):
 cmd_editdelay = _delay_command(
     "edit_delay",
     "editdelay",
-    "Edited messages will be deleted <b>{}</b> after the edit.",
-    "Edited messages will be deleted <b>instantly</b>.",
+    "<b>Edit delay updated.</b>\nEdited messages will now be removed <b>{}</b> after the edit.",
+    "<b>Edit delay cleared.</b>\nEdited messages will now be removed immediately.",
 )
 cmd_mediadelay = _delay_command(
     "media_delay",
     "mediadelay",
-    "Media will be auto-deleted <b>{}</b> after it is sent.",
-    "Media auto-delete is now <b>off</b>.",
+    "<b>Media timer updated.</b>\nMedia will now disappear <b>{}</b> after it's posted.",
+    "<b>Media timer switched off.</b>\nMedia will stay in the chat.",
 )
 
 
@@ -545,17 +635,17 @@ def _auth_command(kind: str, grant: bool, text: str):
 
 
 @admin_only
-async def cmd_authlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_allowlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    lines = ["<b>Authorized users</b>"]
-    for kind, title in (("edit", "✏️ May edit messages"), ("media", "🖼 Media exempt")):
+    lines = ["<b>Exemptions in this chat</b>"]
+    for kind, title in (("edit", "Can edit messages"), ("media", "Media is never removed")):
         rows = db.execute(
             "SELECT * FROM auth WHERE chat_id=? AND kind=?", (msg.chat_id, kind)
         ).fetchall()
         lines.append(f"\n<b>{title}</b>")
         lines += [
-            f"• {link(r['user_id'], r['name'])} (<code>{r['user_id']}</code>)" for r in rows
-        ] or ["• <i>none</i>"]
+            f"  • {link(r['user_id'], r['name'])} · <code>{r['user_id']}</code>" for r in rows
+        ] or ["  <i>nobody yet</i>"]
     await reply(msg, "\n".join(lines))
 
 
@@ -564,19 +654,106 @@ async def cmd_nsfw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     arg = context.args[0].lower() if context.args else ""
     if arg not in ("on", "off"):
-        state = "on" if settings(msg.chat_id)["nsfw"] else "off"
+        state = "active" if settings(msg.chat_id)["nsfw"] else "inactive"
         await reply(
             msg,
-            f"🔞 NSFW protection is currently <b>{state}</b>.\n"
-            "<b>Usage:</b> <code>/nsfw on</code> or <code>/nsfw off</code>",
+            f"<b>Explicit-media filter is {state}.</b>\n"
+            "Switch it with <code>/nsfw on</code> or <code>/nsfw off</code>.",
         )
         return
     set_setting(msg.chat_id, "nsfw", int(arg == "on"))
     await reply(
         msg,
-        "✅ NSFW protection is <b>on</b>. Adult stickers, photos, videos and GIFs will be removed."
+        "<b>Explicit-media filter enabled.</b>\n"
+        "I'll scan stickers, photos, videos and GIFs and remove anything explicit."
         if arg == "on"
-        else "✅ NSFW protection is <b>off</b>.",
+        else "<b>Explicit-media filter disabled.</b>",
+    )
+
+
+@admin_only
+async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    raw = (msg.text or "").split(None, 1)
+    terms = [t.strip().casefold() for t in raw[1].split(",")] if len(raw) > 1 else []
+    terms = [t[:80] for t in terms if len(t) >= 2]
+    if not terms:
+        return await reply(
+            msg,
+            "<b>How to use /block</b>\n"
+            "<code>/block movie name, leaked, camrip</code>\n\n"
+            "Separate several words or phrases with commas. I match them in messages, "
+            "captions, file names and the names of channels a message was forwarded from.",
+        )
+    for term in terms:
+        db.execute("INSERT OR IGNORE INTO blocklist VALUES(?,?)", (msg.chat_id, term))
+    listed = ", ".join(f"<code>{html.escape(t)}</code>" for t in terms)
+    await reply(msg, f"<b>Blocklist updated.</b>\nAdded: {listed}")
+
+
+@admin_only
+async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    raw = (msg.text or "").split(None, 1)
+    terms = [t.strip().casefold() for t in raw[1].split(",") if t.strip()] if len(raw) > 1 else []
+    if not terms:
+        return await reply(msg, "Tell me what to remove, e.g. <code>/unblock camrip</code>.")
+    removed = 0
+    for term in terms:
+        removed += db.execute(
+            "DELETE FROM blocklist WHERE chat_id=? AND term=?", (msg.chat_id, term)
+        ).rowcount
+    await reply(
+        msg,
+        f"<b>Blocklist updated.</b>\nRemoved {removed} entr{'y' if removed == 1 else 'ies'}."
+        if removed
+        else "None of those were on the blocklist.",
+    )
+
+
+@admin_only
+async def cmd_blocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    terms = sorted(blocked_terms(msg.chat_id))
+    if not terms:
+        return await reply(msg, "The blocklist is empty. Add entries with <code>/block</code>.")
+    body = "\n".join(f"  • <code>{html.escape(t)}</code>" for t in terms)
+    await reply(msg, f"<b>Blocklist · {len(terms)} entries</b>\n{body}")
+
+
+def _lock_command(value: int):
+    @admin_only
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        msg = update.effective_message
+        names = [a.lower() for a in context.args]
+        if names == ["all"]:
+            names = list(LOCKS)
+        if not names or any(n not in LOCKS for n in names):
+            options = ", ".join(f"<code>{n}</code>" for n in LOCKS)
+            verb = "lock" if value else "unlock"
+            return await reply(
+                msg,
+                f"<b>How to use /{verb}</b>\n"
+                f"<code>/{verb} files videos</code> or <code>/{verb} all</code>\n\n"
+                f"Available types: {options}",
+            )
+        for n in names:
+            set_setting(msg.chat_id, LOCKS[n][0], value)
+        listed = ", ".join(names)
+        await reply(msg, f"<b>{'Locked' if value else 'Unlocked'}:</b> {listed}")
+
+    return handler
+
+
+@admin_only
+async def cmd_locks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    s = settings(msg.chat_id)
+    lines = [f"  {'🔒' if s[col] else '🔓'} {name}" for name, (col, *_) in LOCKS.items()]
+    await reply(
+        msg,
+        "<b>Content locks</b>\n" + "\n".join(lines) + "\n\nChange with <code>/lock</code> "
+        "and <code>/unlock</code>, or from /settings.",
     )
 
 
@@ -589,10 +766,10 @@ async def _mod_target(update, context):
         await reply(msg, NO_TARGET)
         return None
     if uid == context.bot.id:
-        await reply(msg, "🙂 I can't moderate myself.")
+        await reply(msg, "I'd rather not do that to myself.")
         return None
     if uid < 0 or await is_admin(context, msg.chat_id, uid):
-        await reply(msg, "🚫 Admins and channels can't be moderated with this command.")
+        await reply(msg, "That account is an admin or a channel, so I'll leave it alone.")
         return None
     return uid, name, rest
 
@@ -617,29 +794,125 @@ def undo_button(label: str, action: str, uid: int):
     return InlineKeyboardMarkup([[Btn(label, callback_data=f"m:{action}:{uid}")]])
 
 
-def _reason(rest) -> str:
-    return f"\n<b>Reason:</b> {html.escape(' '.join(rest))}" if rest else ""
+def _card(title: str, uid: int, name: str, rest, extra: str = "") -> str:
+    """Uniform moderation notice."""
+    lines = [f"<b>{title}</b>", f"User: {link(uid, name)} · <code>{uid}</code>"]
+    if extra:
+        lines.append(extra)
+    if rest:
+        lines.append(f"Reason: {html.escape(' '.join(rest))}")
+    return "\n".join(lines)
 
 
-@admin_only
-async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _ban(update, context):
     msg = update.effective_message
     target = await _mod_target(update, context)
     if not target:
-        return
+        return False
     uid, name, rest = target
     seconds, rest = take_duration(rest)
     try:
         until = int(time.time()) + seconds if seconds else None
         await context.bot.ban_chat_member(msg.chat_id, uid, until_date=until)
     except TelegramError as e:
-        return await fail(msg, e)
-    period = f" for <b>{fmt_duration(seconds)}</b>" if seconds else ""
+        await fail(msg, e)
+        return False
+    extra = f"Duration: {fmt_duration(seconds)}" if seconds else "Duration: permanent"
+    await reply(msg, _card("🚫 Banned", uid, name, rest, extra), undo_button("Lift ban", "unban", uid))
+    return True
+
+
+async def _kick(update, context):
+    msg = update.effective_message
+    target = await _mod_target(update, context)
+    if not target:
+        return False
+    uid, name, rest = target
+    try:
+        await do_kick(context.bot, msg.chat_id, uid)
+    except TelegramError as e:
+        await fail(msg, e)
+        return False
+    await reply(msg, _card("👢 Removed from the chat", uid, name, rest, "They can rejoin later."))
+    return True
+
+
+async def _mute(update, context):
+    msg = update.effective_message
+    target = await _mod_target(update, context)
+    if not target:
+        return False
+    uid, name, rest = target
+    seconds, rest = take_duration(rest)
+    try:
+        await do_mute(context.bot, msg.chat_id, uid, seconds)
+    except TelegramError as e:
+        await fail(msg, e)
+        return False
+    extra = f"Duration: {fmt_duration(seconds)}" if seconds else "Duration: until unmuted"
+    await reply(msg, _card("🔇 Muted", uid, name, rest, extra), undo_button("Unmute", "unmute", uid))
+    return True
+
+
+WARN_ACTIONS = {"mute": "muted", "kick": "removed", "ban": "banned"}
+
+
+async def _warn(update, context):
+    msg = update.effective_message
+    target = await _mod_target(update, context)
+    if not target:
+        return False
+    uid, name, rest = target
+    s = settings(msg.chat_id)
+    db.execute("INSERT INTO warns VALUES(?,?,?,?)", (msg.chat_id, uid, " ".join(rest), time.time()))
+    count = warn_count(msg.chat_id, uid)
+    if count < s["warn_limit"]:
+        await reply(
+            msg,
+            _card("⚠️ Warning issued", uid, name, rest, f"Count: {count} of {s['warn_limit']}"),
+            undo_button("Withdraw warning", "unwarn", uid),
+        )
+        return True
+    action = s["warn_action"]
+    try:
+        if action == "ban":
+            await context.bot.ban_chat_member(msg.chat_id, uid)
+        elif action == "kick":
+            await do_kick(context.bot, msg.chat_id, uid)
+        else:
+            await do_mute(context.bot, msg.chat_id, uid)
+    except TelegramError as e:
+        await fail(msg, e)
+        return False
+    db.execute("DELETE FROM warns WHERE chat_id=? AND user_id=?", (msg.chat_id, uid))
+    undo = {"ban": ("Lift ban", "unban"), "mute": ("Unmute", "unmute")}.get(action)
     await reply(
         msg,
-        f"🚫 {link(uid, name)} has been banned{period}.{_reason(rest)}",
-        undo_button("↩️ Unban", "unban", uid),
+        _card(
+            "⛔ Warning limit reached",
+            uid,
+            name,
+            rest,
+            f"Count: {count} of {s['warn_limit']} — user has been {WARN_ACTIONS[action]}.",
+        ),
+        undo_button(undo[0], undo[1], uid) if undo else None,
     )
+    return True
+
+
+def _mod_command(action, also_delete: bool = False):
+    """Wrap a moderation action; the 'd' variants also delete the replied message."""
+
+    @admin_only
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        msg = update.effective_message
+        target = msg.reply_to_message
+        if also_delete and (not target or target.forum_topic_created):
+            return await reply(msg, "Reply to the offending message so I know what to delete.")
+        if await action(update, context) and also_delete:
+            await delete(context.bot, msg.chat_id, target.message_id)
+
+    return handler
 
 
 @admin_only
@@ -652,41 +925,7 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.unban_chat_member(msg.chat_id, uid, only_if_banned=True)
     except TelegramError as e:
         return await fail(msg, e)
-    await reply(msg, f"✅ {link(uid, name)} has been unbanned.")
-
-
-@admin_only
-async def cmd_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    target = await _mod_target(update, context)
-    if not target:
-        return
-    uid, name, rest = target
-    try:
-        await do_kick(context.bot, msg.chat_id, uid)
-    except TelegramError as e:
-        return await fail(msg, e)
-    await reply(msg, f"👢 {link(uid, name)} has been removed from the group.{_reason(rest)}")
-
-
-@admin_only
-async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    target = await _mod_target(update, context)
-    if not target:
-        return
-    uid, name, rest = target
-    seconds, rest = take_duration(rest)
-    try:
-        await do_mute(context.bot, msg.chat_id, uid, seconds)
-    except TelegramError as e:
-        return await fail(msg, e)
-    period = f" for <b>{fmt_duration(seconds)}</b>" if seconds else ""
-    await reply(
-        msg,
-        f"🔇 {link(uid, name)} has been muted{period}.{_reason(rest)}",
-        undo_button("🔊 Unmute", "unmute", uid),
-    )
+    await reply(msg, f"<b>Ban lifted.</b>\n{link(uid, name)} is free to rejoin.")
 
 
 @admin_only
@@ -699,48 +938,7 @@ async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await do_unmute(context.bot, msg.chat_id, uid)
     except TelegramError as e:
         return await fail(msg, e)
-    await reply(msg, f"🔊 {link(uid, name)} has been unmuted.")
-
-
-WARN_ACTIONS = {"mute": "muted", "kick": "removed", "ban": "banned"}
-
-
-@admin_only
-async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    target = await _mod_target(update, context)
-    if not target:
-        return
-    uid, name, rest = target
-    s = settings(msg.chat_id)
-    db.execute("INSERT INTO warns VALUES(?,?,?,?)", (msg.chat_id, uid, " ".join(rest), time.time()))
-    count = warn_count(msg.chat_id, uid)
-    if count < s["warn_limit"]:
-        await reply(
-            msg,
-            f"⚠️ {link(uid, name)} has been warned "
-            f"(<b>{count}/{s['warn_limit']}</b>).{_reason(rest)}",
-            undo_button("↩️ Remove warning", "unwarn", uid),
-        )
-        return
-    action = s["warn_action"]
-    try:
-        if action == "ban":
-            await context.bot.ban_chat_member(msg.chat_id, uid)
-        elif action == "kick":
-            await do_kick(context.bot, msg.chat_id, uid)
-        else:
-            await do_mute(context.bot, msg.chat_id, uid)
-    except TelegramError as e:
-        return await fail(msg, e)
-    db.execute("DELETE FROM warns WHERE chat_id=? AND user_id=?", (msg.chat_id, uid))
-    undo = {"ban": ("↩️ Unban", "unban"), "mute": ("🔊 Unmute", "unmute")}.get(action)
-    await reply(
-        msg,
-        f"⛔ {link(uid, name)} reached <b>{count}/{s['warn_limit']}</b> warnings "
-        f"and has been <b>{WARN_ACTIONS[action]}</b>.{_reason(rest)}",
-        undo_button(undo[0], undo[1], uid) if undo else None,
-    )
+    await reply(msg, f"<b>Unmuted.</b>\n{link(uid, name)} can send messages again.")
 
 
 def remove_last_warn(chat_id: int, uid: int) -> bool:
@@ -763,21 +961,21 @@ async def cmd_unwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         limit = settings(msg.chat_id)["warn_limit"]
         await reply(
             msg,
-            f"✅ Removed one warning from {link(uid, name)} "
-            f"(<b>{warn_count(msg.chat_id, uid)}/{limit}</b>).",
+            f"<b>Warning withdrawn.</b>\n{link(uid, name)} is now at "
+            f"{warn_count(msg.chat_id, uid)} of {limit}.",
         )
     else:
-        await reply(msg, f"ℹ️ {link(uid, name)} has no warnings.")
+        await reply(msg, f"{link(uid, name)} has a clean record — nothing to withdraw.")
 
 
 @admin_only
-async def cmd_resetwarns(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_clearwarns(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     uid, name, _ = resolve_target(msg, context.args)
     if uid is None:
         return await reply(msg, NO_TARGET)
     db.execute("DELETE FROM warns WHERE chat_id=? AND user_id=?", (msg.chat_id, uid))
-    await reply(msg, f"✅ All warnings for {link(uid, name)} have been cleared.")
+    await reply(msg, f"<b>Record cleared.</b>\n{link(uid, name)} starts fresh with zero warnings.")
 
 
 @group_only
@@ -790,8 +988,10 @@ async def cmd_warns(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "SELECT reason FROM warns WHERE chat_id=? AND user_id=? ORDER BY ts", (msg.chat_id, uid)
     ).fetchall()
     limit = settings(msg.chat_id)["warn_limit"]
-    lines = [f"⚠️ {link(uid, name)} has <b>{len(rows)}/{limit}</b> warnings."]
-    lines += [f"{i}. {html.escape(r['reason'] or 'No reason given')}" for i, r in enumerate(rows, 1)]
+    if not rows:
+        return await reply(msg, f"{link(uid, name)} has no warnings on record.")
+    lines = [f"<b>Warnings for {link(uid, name)}</b> · {len(rows)} of {limit}"]
+    lines += [f"  {i}. {html.escape(r['reason'] or 'no reason noted')}" for i, r in enumerate(rows, 1)]
     await reply(msg, "\n".join(lines))
 
 
@@ -799,30 +999,73 @@ async def cmd_warns(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg.reply_to_message:
-        return await reply(msg, "ℹ️ Reply to the message you want to delete.")
+        return await reply(msg, "Reply to the message you'd like removed.")
     await delete(context.bot, msg.chat_id, msg.reply_to_message.message_id)
     await delete(context.bot, msg.chat_id, msg.message_id)
 
 
 @admin_only
 async def cmd_purge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/purge (reply) = from that message down; /purge N = the last N messages."""
     msg = update.effective_message
-    if not msg.reply_to_message:
-        return await reply(msg, "ℹ️ Reply to the first message to purge from (max 500 messages).")
-    ids = list(range(msg.reply_to_message.message_id, msg.message_id + 1))[-500:]
+    count = int(context.args[0]) if context.args and context.args[0].isdigit() else 0
+    start = msg.reply_to_message.message_id if msg.reply_to_message else None
+    if start is None and not count:
+        return await reply(
+            msg,
+            "<b>How to use /purge</b>\n"
+            "Reply to a message with <code>/purge</code> to clear everything from there down, "
+            "or send <code>/purge 50</code> to clear the latest 50 messages.\n"
+            "Up to 500 messages per run.",
+        )
+    count = min(count, 500)
+    if start is None:
+        ids = list(range(max(1, msg.message_id - count), msg.message_id + 1))
+    else:
+        end = start + count - 1 if count else msg.message_id
+        ids = list(range(start, min(end, msg.message_id) + 1))[-500:]
+        if msg.message_id not in ids:
+            ids.append(msg.message_id)
     try:
-        for i in range(0, len(ids), 100):
-            await context.bot.delete_messages(msg.chat_id, ids[i : i + 100])
+        await bulk_delete(context.bot, msg.chat_id, ids)
     except TelegramError as e:
         return await fail(msg, e)
-    await notify(context.bot, msg.chat_id, "🧹 Purge complete.", ttl=5)
+    await notify(context.bot, msg.chat_id, "🧹 Cleanup finished.", ttl=5)
+
+
+@admin_only
+async def cmd_purgeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    uid, name, _ = resolve_target(msg, context.args)
+    if uid is None:
+        return await reply(msg, NO_TARGET)
+    ids = [
+        r["message_id"]
+        for r in db.execute(
+            "SELECT message_id FROM msglog WHERE chat_id=? AND user_id=? "
+            "ORDER BY message_id DESC LIMIT 500",
+            (msg.chat_id, uid),
+        )
+    ]
+    if not ids:
+        return await reply(msg, f"I have no recent messages from {link(uid, name)} on record.")
+    try:
+        await bulk_delete(context.bot, msg.chat_id, ids)
+    except TelegramError as e:
+        return await fail(msg, e)
+    db.execute("DELETE FROM msglog WHERE chat_id=? AND user_id=?", (msg.chat_id, uid))
+    await reply(
+        msg,
+        f"<b>Messages cleared.</b>\nRemoved {len(ids)} recent message"
+        f"{'' if len(ids) == 1 else 's'} from {link(uid, name)}.",
+    )
 
 
 @admin_only
 async def cmd_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg.reply_to_message:
-        return await reply(msg, "ℹ️ Reply to the message you want to pin.")
+        return await reply(msg, "Reply to the message you'd like pinned.")
     loud = bool(context.args) and context.args[0].lower() in ("loud", "notify")
     try:
         await msg.reply_to_message.pin(disable_notification=not loud)
@@ -838,7 +1081,7 @@ async def cmd_unpin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_to_message.unpin()
         else:
             await context.bot.unpin_chat_message(msg.chat_id)
-        await reply(msg, "📌 Message unpinned.")
+        await reply(msg, "<b>Unpinned.</b>")
     except TelegramError as e:
         await fail(msg, e)
 
@@ -860,13 +1103,15 @@ async def cmd_setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return await reply(
             msg,
-            "<b>Usage:</b> <code>/setwelcome Welcome {name} to {group}!</code>\n"
-            "<code>{name}</code> = the new member, <code>{group}</code> = the group name.",
+            "<b>How to use /setwelcome</b>\n"
+            "<code>/setwelcome Hi {name}, welcome to {group}!</code>\n\n"
+            "<code>{name}</code> becomes the new member's name and "
+            "<code>{group}</code> the chat title.",
         )
     set_setting(msg.chat_id, "welcome_text", text[:1000])
     set_setting(msg.chat_id, "welcome_on", 1)
     preview = render_welcome(settings(msg.chat_id), msg.from_user, msg.chat.title)
-    await reply(msg, f"✅ Welcome message saved and enabled. Preview:\n\n{preview}")
+    await reply(msg, f"<b>Greeting saved and switched on.</b> Here's how it looks:\n\n{preview}")
 
 
 @admin_only
@@ -875,13 +1120,13 @@ async def cmd_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arg = context.args[0].lower() if context.args else ""
     if arg in ("on", "off"):
         set_setting(msg.chat_id, "welcome_on", int(arg == "on"))
-        return await reply(msg, f"✅ Welcome messages are now <b>{arg}</b>.")
+        return await reply(msg, f"<b>Greetings switched {arg}.</b>")
     s = settings(msg.chat_id)
     await reply(
         msg,
-        f"👋 Welcome messages are <b>{'on' if s['welcome_on'] else 'off'}</b>. Current message:\n\n"
+        f"<b>Greetings are {'on' if s['welcome_on'] else 'off'}.</b> Current text:\n\n"
         f"{render_welcome(s, msg.from_user, msg.chat.title)}\n\n"
-        "<code>/welcome on|off</code> · <code>/setwelcome &lt;text&gt;</code>",
+        "Toggle with <code>/welcome on|off</code>, edit with <code>/setwelcome</code>.",
     )
 
 
@@ -891,10 +1136,12 @@ async def cmd_setrules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = _text_after_command(msg)
     if not text:
         return await reply(
-            msg, "<b>Usage:</b> <code>/setrules &lt;text&gt;</code> or reply to a message with /setrules."
+            msg,
+            "Add the rules after the command, or reply to a message containing them "
+            "with <code>/setrules</code>.",
         )
     set_setting(msg.chat_id, "rules", text[:3500])
-    await reply(msg, "✅ Group rules saved. Members can read them with /rules.")
+    await reply(msg, "<b>Rules saved.</b>\nAnyone can read them with /rules.")
 
 
 @group_only
@@ -902,8 +1149,8 @@ async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     rules = settings(msg.chat_id)["rules"]
     if not rules:
-        return await reply(msg, "ℹ️ No rules have been set for this group yet.")
-    await reply(msg, f"📜 <b>Rules of {html.escape(msg.chat.title or 'this group')}</b>\n\n{html.escape(rules)}")
+        return await reply(msg, "This chat hasn't published any rules yet.")
+    await reply(msg, f"<b>{html.escape(msg.chat.title or 'Chat')} · Rules</b>\n\n{html.escape(rules)}")
 
 
 @group_only
@@ -911,10 +1158,10 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     target = msg.reply_to_message
     if not target or target.forum_topic_created:
-        return await reply(msg, "ℹ️ Reply to the message you want to report to the admins.")
+        return await reply(msg, "Reply to the message you want the admins to look at.")
     uid = target.sender_chat.id if target.sender_chat else target.from_user.id
     if target.sender_chat or await is_admin(context, msg.chat_id, uid):
-        return await reply(msg, "🚫 Admins can't be reported.")
+        return await reply(msg, "That message is from an admin, so there's nothing to flag.")
     try:
         admins = await context.bot.get_chat_administrators(msg.chat_id)
     except TelegramError:
@@ -926,19 +1173,20 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     markup = InlineKeyboardMarkup(
         [
             [
-                Btn("🗑 Delete", callback_data=f"r:del:{mid}:{uid}"),
-                Btn("⚠️ Warn", callback_data=f"r:warn:{mid}:{uid}"),
+                Btn("Delete", callback_data=f"r:del:{mid}:{uid}"),
+                Btn("Warn", callback_data=f"r:warn:{mid}:{uid}"),
             ],
             [
-                Btn("🔇 Mute", callback_data=f"r:mute:{mid}:{uid}"),
-                Btn("🚫 Ban", callback_data=f"r:ban:{mid}:{uid}"),
+                Btn("Mute", callback_data=f"r:mute:{mid}:{uid}"),
+                Btn("Ban", callback_data=f"r:ban:{mid}:{uid}"),
             ],
-            [Btn("✖️ Dismiss", callback_data=f"r:x:{mid}:{uid}")],
+            [Btn("Ignore", callback_data=f"r:x:{mid}:{uid}")],
         ]
     )
     await target.reply_text(
-        f"🚨 <b>Reported to admins</b>{ping}\n"
-        f"{mention_of(msg)} reported a message from {mention_of(target)}.",
+        f"🚩 <b>Flagged for review</b>{ping}\n"
+        f"Reported by {mention_of(msg)} · Author: {mention_of(target)}\n"
+        "<i>Admins: choose an action below.</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=markup,
     )
@@ -947,17 +1195,17 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @group_only
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    lines = [f"<b>Chat ID:</b> <code>{msg.chat_id}</code>"]
+    lines = [f"Chat · <code>{msg.chat_id}</code>"]
     r = msg.reply_to_message
     if r and not r.forum_topic_created and r.from_user:
-        lines.append(f"<b>{html.escape(r.from_user.first_name)}'s ID:</b> <code>{r.from_user.id}</code>")
+        lines.append(f"{html.escape(r.from_user.first_name)} · <code>{r.from_user.id}</code>")
     else:
-        lines.append(f"<b>Your ID:</b> <code>{msg.from_user.id}</code>")
+        lines.append(f"You · <code>{msg.from_user.id}</code>")
     await reply(msg, "\n".join(lines))
 
 
 @admin_only
-async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_whois(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     uid, name, _ = resolve_target(msg, context.args)
     if uid is None:
@@ -967,165 +1215,172 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         status = "unknown"
     limit = settings(msg.chat_id)["warn_limit"]
-    yes_no = lambda v: "yes" if v else "no"  # noqa: E731
+    mark = lambda v: "yes" if v else "no"  # noqa: E731
     await reply(
         msg,
-        f"👤 <b>User info</b>\n"
-        f"<b>Name:</b> {link(uid, name)}\n"
-        f"<b>ID:</b> <code>{uid}</code>\n"
-        f"<b>Status:</b> {status}\n"
-        f"<b>Warnings:</b> {warn_count(msg.chat_id, uid)}/{limit}\n"
-        f"<b>May edit:</b> {yes_no(is_authed(msg.chat_id, uid, 'edit'))}\n"
-        f"<b>Media exempt:</b> {yes_no(is_authed(msg.chat_id, uid, 'media'))}",
+        f"<b>Profile · {link(uid, name)}</b>\n"
+        f"ID: <code>{uid}</code>\n"
+        f"Role: {status}\n"
+        f"Warnings: {warn_count(msg.chat_id, uid)} of {limit}\n"
+        f"Edit exemption: {mark(is_authed(msg.chat_id, uid, 'edit'))}\n"
+        f"Media exemption: {mark(is_authed(msg.chat_id, uid, 'media'))}",
     )
 
 
 # ----------------------------------------------------------- settings panel
-SCOPES = (("user", "User"), ("all", "Admin | User"))
+SCOPES = (("user", "Members"), ("all", "Everyone"))
 CHOICES = {
-    "edit_delay": ((0, "Instant"), (30, "30s"), (60, "1m"), (120, "2m"), (300, "5m"), (600, "10m")),
-    "media_delay": ((0, "Off"), (60, "1m"), (300, "5m"), (600, "10m"), (1800, "30m"), (3600, "1h")),
-    "notice_ttl": ((0, "Keep"), (30, "30s"), (60, "1m"), (300, "5m")),
+    "edit_delay": ((0, "Now"), (30, "30s"), (60, "1m"), (120, "2m"), (300, "5m"), (600, "10m")),
+    "media_delay": ((0, "Never"), (60, "1m"), (300, "5m"), (600, "10m"), (1800, "30m"), (3600, "1h")),
+    "notice_ttl": ((0, "Never"), (30, "30s"), (60, "1m"), (300, "5m")),
     "warn_limit": ((2, "2"), (3, "3"), (4, "4"), (5, "5")),
-    "warn_action": (("mute", "Mute"), ("kick", "Kick"), ("ban", "Ban")),
+    "warn_action": (("mute", "Mute"), ("kick", "Remove"), ("ban", "Ban")),
     "edit_scope": SCOPES,
     "nsfw_scope": SCOPES,
     "media_scope": SCOPES,
 }
-TOGGLES = {"edit_on", "nsfw", "antilink", "antiforward", "welcome_on", "clean_service"}
+TOGGLES = {"edit_on", "nsfw", "welcome_on", "clean_service"} | {col for col, *_ in LOCKS.values()}
 SCOPE_LABEL = dict(SCOPES)
 
 
 def _state(on) -> str:
-    return "✅ On" if on else "❌ Off"
+    return "on" if on else "off"
 
 
-def _toggle(panel, key, label, s):
-    return [Btn(f"{label}: {_state(s[key])}", callback_data=f"t:{panel}:{key}")]
+def _tbtn(panel, key, label, s):
+    return Btn(f"{'🟢' if s[key] else '⚪️'} {label}", callback_data=f"t:{panel}:{key}")
 
 
 def _label(text):
-    return [Btn(text, callback_data="noop")]
+    return [Btn(f"— {text} —", callback_data="noop")]
 
 
 def _choices(panel, key, s, per_row=3):
     buttons = [
-        Btn(("🔘 " if s[key] == value else "") + label, callback_data=f"v:{panel}:{key}:{value}")
+        Btn(("● " if s[key] == value else "") + label, callback_data=f"v:{panel}:{key}:{value}")
         for value, label in CHOICES[key]
     ]
     return [buttons[i : i + per_row] for i in range(0, len(buttons), per_row)]
 
 
-BACK = [Btn("« Back", callback_data="s:main")]
+BACK = [Btn("‹ Overview", callback_data="s:main")]
 
 
 def panel_view(chat_id: int, panel: str, title: str = ""):
     s = settings(chat_id)
     media = fmt_duration(s["media_delay"]) if s["media_delay"] else "off"
+    active_locks = [name for name, (col, *_) in LOCKS.items() if s[col]]
     if panel == "edit":
         text = (
-            "✏️ <b>Edit Guard</b>\n"
-            "Deletes any message that gets edited and tells the user why.\n\n"
-            f"Current delay: <b>{fmt_duration(s['edit_delay'])}</b>\n"
-            "Custom delay: <code>/editdelay 3m</code>\n"
-            "Allow a user to edit: <code>/auth</code>"
+            "<b>Edit protection</b>\n"
+            "When someone edits a message, I remove it and let them know why.\n\n"
+            f"Removal: <b>{fmt_duration(s['edit_delay'])}</b>\n"
+            "Need a different delay? <code>/editdelay 3m</code>\n"
+            "Let someone edit freely: <code>/allowedit</code>"
         )
         rows = [
-            _toggle(panel, "edit_on", "Edit Guard", s),
-            _label("⏱ Delete after"),
+            [_tbtn(panel, "edit_on", "Edit protection", s)],
+            _label("Remove after"),
             *_choices(panel, "edit_delay", s),
-            _label("👥 Applies to"),
+            _label("Enforce on"),
             *_choices(panel, "edit_scope", s),
             BACK,
         ]
     elif panel == "media":
         text = (
-            "🖼 <b>Media auto-delete</b>\n"
-            "Removes photos, videos, stickers, GIFs, files and voice notes after a delay. "
-            "Text messages are never touched.\n\n"
-            f"Current delay: <b>{media}</b>\n"
-            "Custom delay: <code>/mediadelay 15m</code>\n"
-            "Exempt a user: <code>/authmedia</code>"
+            "<b>Media timer</b>\n"
+            "Photos, videos, stickers, GIFs, files and voice notes vanish after the time "
+            "you choose. Plain text is left alone.\n\n"
+            f"Timer: <b>{media}</b>\n"
+            "Need a different time? <code>/mediadelay 15m</code>\n"
+            "Keep someone's media: <code>/allowmedia</code>"
         )
         rows = [
-            _label("⏱ Delete media after"),
+            _label("Remove media after"),
             *_choices(panel, "media_delay", s),
-            _label("👥 Applies to"),
+            _label("Enforce on"),
             *_choices(panel, "media_scope", s),
             BACK,
         ]
     elif panel == "nsfw":
         text = (
-            "🔞 <b>NSFW protection</b>\n"
-            "Scans stickers, photos, videos and GIFs and removes adult content. "
-            "Text is not scanned.\n\nExempt a user: <code>/authmedia</code>"
+            "<b>Explicit-media filter</b>\n"
+            "Every sticker, photo, video and GIF is scanned on arrival; explicit material "
+            "is removed automatically. Text isn't scanned.\n\n"
+            "Skip scanning for someone: <code>/allowmedia</code>"
         )
         rows = [
-            _toggle(panel, "nsfw", "NSFW protection", s),
-            _label("👥 Applies to"),
+            [_tbtn(panel, "nsfw", "Explicit-media filter", s)],
+            _label("Enforce on"),
             *_choices(panel, "nsfw_scope", s),
             BACK,
         ]
     elif panel == "locks":
+        terms = len(blocked_terms(chat_id))
         text = (
-            "🔒 <b>Locks</b>\n"
-            "Block content from regular members. Admins and <code>/auth</code> users are not affected."
+            "<b>Content locks</b>\n"
+            "Stop members from posting the kinds of content that put a group at risk — "
+            "pirated files, movie and music uploads, spam links, channel reposts.\n\n"
+            f"Blocklist: <b>{terms}</b> entr{'y' if terms == 1 else 'ies'} "
+            "(<code>/block</code>, <code>/blocklist</code>)\n"
+            "<i>Admins and /allowedit users are never restricted.</i>"
         )
-        rows = [
-            _toggle(panel, "antilink", "🔗 Block links", s),
-            _toggle(panel, "antiforward", "↪️ Block forwards", s),
+        buttons = [_tbtn(panel, col, label, s) for col, label, *_ in LOCKS.values()]
+        rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+        rows += [
+            [Btn("Lock everything", callback_data="la:1"), Btn("Unlock everything", callback_data="la:0")],
             BACK,
         ]
     elif panel == "warns":
         text = (
-            "⚠️ <b>Warnings</b>\n"
-            "<code>/warn</code> adds a warning. When a member reaches the limit, "
-            "the chosen action is applied automatically."
+            "<b>Warning system</b>\n"
+            "Each <code>/warn</code> adds to a member's record. Once they hit the limit, "
+            "the penalty below is applied and their record resets."
         )
         rows = [
-            _label("🔢 Warning limit"),
+            _label("Limit"),
             *_choices(panel, "warn_limit", s, per_row=4),
-            _label("⚖️ Action at limit"),
+            _label("Penalty"),
             *_choices(panel, "warn_action", s),
             BACK,
         ]
     elif panel == "welcome":
         text = (
-            "👋 <b>Welcome &amp; rules</b>\n\n"
-            f"<b>Welcome message:</b>\n{html.escape(s['welcome_text'] or DEFAULT_WELCOME)}\n\n"
-            f"<b>Rules:</b> {'set' if s['rules'] else 'not set'}\n\n"
-            "Change with <code>/setwelcome</code> and <code>/setrules</code>."
+            "<b>Greetings &amp; rules</b>\n\n"
+            f"Greeting text:\n<i>{html.escape(s['welcome_text'] or DEFAULT_WELCOME)}</i>\n\n"
+            f"Rules: <b>{'published' if s['rules'] else 'not set'}</b>\n\n"
+            "Edit with <code>/setwelcome</code> and <code>/setrules</code>."
         )
-        rows = [_toggle(panel, "welcome_on", "Welcome new members", s), BACK]
+        rows = [[_tbtn(panel, "welcome_on", "Greet new members", s)], BACK]
     elif panel == "clean":
         text = (
-            "🧹 <b>Cleanup</b>\n"
-            "Keep the chat tidy: hide join/leave messages and let my own notices "
-            "disappear after a while."
+            "<b>Housekeeping</b>\n"
+            "Keep the chat tidy by hiding join/leave notices and letting my own "
+            "notices expire."
         )
         rows = [
-            _toggle(panel, "clean_service", "Delete join/leave messages", s),
-            _label("🗑 Remove my notices after"),
+            [_tbtn(panel, "clean_service", "Hide join/leave notices", s)],
+            _label("Expire my notices after"),
             *_choices(panel, "notice_ttl", s, per_row=4),
             BACK,
         ]
     else:
         text = (
-            f"⚙️ <b>Settings{' — ' + html.escape(title) if title else ''}</b>\n\n"
-            f"✏️ Edit Guard: <b>{_state(s['edit_on'])}</b> · {fmt_duration(s['edit_delay'])} "
-            f"· {SCOPE_LABEL[s['edit_scope']]}\n"
-            f"🖼 Media auto-delete: <b>{media}</b> · {SCOPE_LABEL[s['media_scope']]}\n"
-            f"🔞 NSFW protection: <b>{_state(s['nsfw'])}</b> · {SCOPE_LABEL[s['nsfw_scope']]}\n"
-            f"🔒 Locks: links <b>{_state(s['antilink'])}</b> · forwards <b>{_state(s['antiforward'])}</b>\n"
-            f"⚠️ Warnings: limit <b>{s['warn_limit']}</b> → {s['warn_action']}\n"
-            f"👋 Welcome: <b>{_state(s['welcome_on'])}</b>\n\n"
-            "Choose a section to configure:"
+            f"<b>Control panel{' · ' + html.escape(title) if title else ''}</b>\n\n"
+            f"Edit protection — <b>{_state(s['edit_on'])}</b>, removes {fmt_duration(s['edit_delay'])}, "
+            f"{SCOPE_LABEL[s['edit_scope']].lower()}\n"
+            f"Media timer — <b>{media}</b>, {SCOPE_LABEL[s['media_scope']].lower()}\n"
+            f"Explicit-media filter — <b>{_state(s['nsfw'])}</b>, {SCOPE_LABEL[s['nsfw_scope']].lower()}\n"
+            f"Content locks — <b>{', '.join(active_locks) or 'none'}</b>\n"
+            f"Warnings — <b>{s['warn_limit']}</b> then {s['warn_action']}\n"
+            f"Greetings — <b>{_state(s['welcome_on'])}</b>\n\n"
+            "Select a module to configure."
         )
         rows = [
-            [Btn("✏️ Edit Guard", callback_data="s:edit"), Btn("🖼 Media", callback_data="s:media")],
-            [Btn("🔞 NSFW", callback_data="s:nsfw"), Btn("🔒 Locks", callback_data="s:locks")],
-            [Btn("⚠️ Warnings", callback_data="s:warns"), Btn("👋 Welcome", callback_data="s:welcome")],
-            [Btn("🧹 Cleanup", callback_data="s:clean"), Btn("✖️ Close", callback_data="s:close")],
+            [Btn("Edit protection", callback_data="s:edit"), Btn("Media timer", callback_data="s:media")],
+            [Btn("Explicit filter", callback_data="s:nsfw"), Btn("Content locks", callback_data="s:locks")],
+            [Btn("Warnings", callback_data="s:warns"), Btn("Greetings", callback_data="s:welcome")],
+            [Btn("Housekeeping", callback_data="s:clean"), Btn("Close", callback_data="s:close")],
         ]
     return text, InlineKeyboardMarkup(rows)
 
@@ -1140,63 +1395,79 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------------------------- help
 HELP_SECTIONS = {
     "protect": (
-        "🛡 Protection",
-        "<b>🛡 Protection</b>\n\n"
-        "/settings — open the settings panel\n"
-        "/editdelay <code>2m</code> — delete edited messages after a delay (<code>0</code> = instant)\n"
-        "/mediadelay <code>10m</code> — auto-delete all media after a delay (<code>off</code> to disable)\n"
-        "/nsfw <code>on|off</code> — remove adult stickers, photos, videos and GIFs\n\n"
+        "Protection",
+        "<b>Protection</b>\n\n"
+        "/settings — open the control panel\n"
+        "/editdelay <code>2m</code> — wait before removing an edited message\n"
+        "/mediadelay <code>10m</code> — remove media after a set time\n"
+        "/nsfw <code>on|off</code> — explicit-media filter\n\n"
         "<b>Exemptions</b>\n"
-        "/auth — allow a user to edit messages\n"
-        "/unauth — revoke edit permission\n"
-        "/authmedia — never delete this user's media\n"
-        "/unauthmedia — revoke media exemption\n"
-        "/authlist — list authorized users",
+        "/allowedit — let a member edit their messages\n"
+        "/revokeedit — take that back\n"
+        "/allowmedia — never remove a member's media\n"
+        "/revokemedia — take that back\n"
+        "/allowlist — see everyone with an exemption",
+    ),
+    "content": (
+        "Content control",
+        "<b>Content control</b>\n"
+        "<i>Tools for keeping risky or infringing material out of the chat.</i>\n\n"
+        "/lock <code>files videos</code> — stop members posting a content type\n"
+        "/unlock <code>files</code> — allow it again\n"
+        "/locks — see what's locked\n"
+        "Types: links, forwards, files, videos, audio, channels, all\n\n"
+        "/block <code>word, phrase</code> — remove messages matching these terms\n"
+        "/unblock <code>word</code> — drop a term\n"
+        "/blocklist — show all terms\n\n"
+        "/del — delete the replied message\n"
+        "/purge — clear from the replied message down, or <code>/purge 50</code>\n"
+        "/purgeuser — clear a member's recent messages",
     ),
     "mod": (
-        "👮 Moderation",
-        "<b>👮 Moderation</b>\n"
-        "<i>Reply to a user, or pass an ID / @username. Duration and reason are optional.</i>\n\n"
-        "/ban <code>[time] [reason]</code> — ban a user\n"
+        "Moderation",
+        "<b>Moderation</b>\n"
+        "<i>Reply to a member, or add their ID / @username. Time and reason are optional.</i>\n\n"
+        "/ban <code>[time] [reason]</code> — ban\n"
+        "/dban — ban and delete the replied message\n"
         "/unban — lift a ban\n"
-        "/kick <code>[reason]</code> — remove a user (they can rejoin)\n"
-        "/mute <code>[time] [reason]</code> — stop a user from sending messages\n"
+        "/kick · /dkick — remove from the chat\n"
+        "/mute <code>[time] [reason]</code> · /dmute — silence\n"
         "/unmute — lift a mute\n"
-        "/warn <code>[reason]</code> — warn a user\n"
-        "/unwarn — remove the latest warning\n"
-        "/resetwarns — clear all warnings\n"
-        "/warns — show a user's warnings\n"
-        "/info — show details about a user",
+        "/warn <code>[reason]</code> · /dwarn — add a warning\n"
+        "/unwarn — withdraw the latest warning\n"
+        "/clearwarns — reset a member's record\n"
+        "/whois — member profile",
     ),
     "tools": (
-        "🧰 Tools",
-        "<b>🧰 Admin tools</b>\n\n"
-        "/del — delete the replied message\n"
-        "/purge — delete everything from the replied message down\n"
+        "Chat tools",
+        "<b>Chat tools</b>\n\n"
         "/pin <code>[loud]</code> — pin the replied message\n"
-        "/unpin — unpin the replied (or latest) message\n"
-        "/setwelcome <code>&lt;text&gt;</code> — set the welcome message\n"
-        "/welcome <code>on|off</code> — toggle welcome messages\n"
-        "/setrules <code>&lt;text&gt;</code> — set the group rules",
-    ),
-    "members": (
-        "👥 Members",
-        "<b>👥 For everyone</b>\n\n"
-        "/rules — read the group rules\n"
-        "/report — report the replied message to the admins\n"
-        "/warns — check your warnings\n"
-        "/id — show chat and user IDs\n"
-        "/help — show this menu",
+        "/unpin — unpin it\n"
+        "/setwelcome <code>&lt;text&gt;</code> — greeting for new members\n"
+        "/welcome <code>on|off</code> — toggle the greeting\n"
+        "/setrules <code>&lt;text&gt;</code> — publish chat rules\n\n"
+        "<b>Open to everyone</b>\n"
+        "/rules — read the rules\n"
+        "/report — flag the replied message for admins\n"
+        "/warns — check a warning record\n"
+        "/id — show chat and user IDs",
     ),
 }
-HELP_HOME = (
-    "🛡 <b>Edit Guard Bot</b>\n"
-    "I keep your group clean: I remove edited messages, auto-delete media, filter NSFW "
-    "content and give admins a full moderation toolkit.\n\n"
-    "<b>Setup:</b> add me to a group, make me admin with <i>Delete messages</i> and "
-    "<i>Ban users</i>, then send /settings there.\n\n"
-    "Pick a category to see the commands:"
-)
+
+
+def help_home(context) -> str:
+    name = html.escape(context.bot.first_name or "this bot")
+    return (
+        f"<b>{name}</b>\n"
+        "Automated protection and moderation for Telegram groups.\n\n"
+        "• Removes edited messages\n"
+        "• Clears media on a timer and filters explicit content\n"
+        "• Locks risky content types and blocks chosen keywords\n"
+        "• Full moderation suite with warnings and reports\n\n"
+        "<b>Getting started</b>\n"
+        "Add me to your group, promote me to admin, then run /settings.\n\n"
+        "Browse the commands below."
+    )
 
 
 def help_markup(context, private: bool):
@@ -1207,7 +1478,7 @@ def help_markup(context, private: bool):
     ]
     if private:
         url = f"https://t.me/{context.bot.username}?startgroup=true"
-        rows.append([Btn("➕ Add me to a group", url=url)])
+        rows.append([Btn("Add to a group", url=url)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1221,9 +1492,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id = 0
         rules = settings(chat_id)["rules"] if chat_id else None
         return await reply(
-            msg, f"📜 <b>Group rules</b>\n\n{html.escape(rules)}" if rules else "ℹ️ No rules found."
+            msg,
+            f"<b>Chat rules</b>\n\n{html.escape(rules)}" if rules else "No rules are published for that chat.",
         )
-    await reply(msg, HELP_HOME, help_markup(context, private))
+    await reply(msg, help_home(context), help_markup(context, private))
 
 
 # ---------------------------------------------------------------- callbacks
@@ -1248,14 +1520,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if kind == "h":  # help pages are open to everyone
         if parts[1] == "home":
-            await _safe_edit(q, HELP_HOME, help_markup(context, chat.type == "private"))
-        else:
-            back = InlineKeyboardMarkup([[Btn("« Back", callback_data="h:home")]])
+            await _safe_edit(q, help_home(context), help_markup(context, chat.type == "private"))
+        elif parts[1] in HELP_SECTIONS:
+            back = InlineKeyboardMarkup([[Btn("‹ All categories", callback_data="h:home")]])
             await _safe_edit(q, HELP_SECTIONS[parts[1]][1], back)
         return await q.answer()
 
     if not await is_admin(context, chat.id, q.from_user.id):
-        return await q.answer("🚫 Only group admins can use these buttons.", show_alert=True)
+        return await q.answer("These controls are for chat admins.", show_alert=True)
 
     if kind == "s":
         if parts[1] == "close":
@@ -1271,7 +1543,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_setting(chat.id, key, new)
         text, markup = panel_view(chat.id, panel, chat.title)
         await _safe_edit(q, text, markup)
-        return await q.answer("Enabled" if new else "Disabled")
+        return await q.answer("Switched on" if new else "Switched off")
+
+    if kind == "la":  # lock / unlock every content type
+        value = int(parts[1] == "1")
+        for column, *_ in LOCKS.values():
+            set_setting(chat.id, column, value)
+        text, markup = panel_view(chat.id, "locks", chat.title)
+        await _safe_edit(q, text, markup)
+        return await q.answer("All content types locked" if value else "All content types unlocked")
 
     if kind == "v" and parts[2] in CHOICES:
         panel, key, raw = parts[1], parts[2], parts[3]
@@ -1281,7 +1561,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_setting(chat.id, key, match[0][0])
         text, markup = panel_view(chat.id, panel, chat.title)
         await _safe_edit(q, text, markup)
-        return await q.answer(f"Set to {match[0][1]}")
+        return await q.answer("Saved")
 
     admin = link(q.from_user.id, q.from_user.first_name, q.from_user.username)
     try:
@@ -1292,16 +1572,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 done = "Ban lifted"
             elif action == "unmute":
                 await do_unmute(context.bot, chat.id, uid)
-                done = "Mute lifted"
+                done = "Unmuted"
             else:
-                done = "Warning removed" if remove_last_warn(chat.id, uid) else "No warnings left"
-            await _safe_edit(q, f"{q.message.text_html}\n\n✅ <b>{done}</b> by {admin}.")
+                done = "Warning withdrawn" if remove_last_warn(chat.id, uid) else "No warnings left"
+            await _safe_edit(q, f"{q.message.text_html}\n\n<i>{done} by {admin}.</i>")
             return await q.answer(done)
 
         if kind == "r":  # report actions
             action, mid, uid = parts[1], int(parts[2]), int(parts[3])
             if action == "x":
-                await q.answer("Report dismissed")
+                await q.answer("Report closed")
                 return await q.message.delete()
             if action in ("del", "mute", "ban"):
                 await delete(context.bot, chat.id, mid)
@@ -1310,60 +1590,73 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif action == "ban":
                 await context.bot.ban_chat_member(chat.id, uid)
             elif action == "warn":
-                db.execute("INSERT INTO warns VALUES(?,?,?,?)", (chat.id, uid, "Reported message", time.time()))
+                db.execute(
+                    "INSERT INTO warns VALUES(?,?,?,?)", (chat.id, uid, "Flagged message", time.time())
+                )
             done = {
-                "del": "Message deleted",
-                "mute": "User muted",
-                "ban": "User banned",
-                "warn": f"User warned ({warn_count(chat.id, uid)}/{settings(chat.id)['warn_limit']})",
+                "del": "message deleted",
+                "mute": "author muted",
+                "ban": "author banned",
+                "warn": f"author warned ({warn_count(chat.id, uid)} of {settings(chat.id)['warn_limit']})",
             }[action]
-            await _safe_edit(q, f"🚨 <b>Report handled</b>\n✅ {done} by {admin}.")
-            return await q.answer(done)
+            await _safe_edit(q, f"🚩 <b>Report resolved</b>\nOutcome: {done}\nHandled by {admin}")
+            return await q.answer("Done")
     except TelegramError as e:
-        return await q.answer(f"Failed: {e}. Check my admin permissions.", show_alert=True)
+        return await q.answer(f"Couldn't complete that: {e}", show_alert=True)
     await q.answer()
 
 
 # --------------------------------------------------------------------- main
 ADMIN_COMMANDS = [
-    ("settings", "Open the settings panel"),
-    ("editdelay", "Delay before edited messages are deleted"),
-    ("mediadelay", "Auto-delete media after a delay"),
-    ("nsfw", "Turn NSFW protection on or off"),
-    ("auth", "Allow a user to edit messages"),
-    ("unauth", "Revoke edit permission"),
-    ("authmedia", "Exempt a user's media from deletion"),
-    ("unauthmedia", "Revoke media exemption"),
-    ("authlist", "List authorized users"),
-    ("ban", "Ban a user"),
-    ("unban", "Unban a user"),
-    ("kick", "Remove a user from the group"),
-    ("mute", "Mute a user"),
-    ("unmute", "Unmute a user"),
-    ("warn", "Warn a user"),
-    ("unwarn", "Remove a user's latest warning"),
-    ("resetwarns", "Clear all warnings of a user"),
-    ("warns", "Show a user's warnings"),
-    ("info", "Show details about a user"),
+    ("settings", "Open the control panel"),
+    ("editdelay", "Set the delay before edited messages are removed"),
+    ("mediadelay", "Set the media auto-remove timer"),
+    ("nsfw", "Toggle the explicit-media filter"),
+    ("allowedit", "Let a member edit messages"),
+    ("revokeedit", "Withdraw a member's edit exemption"),
+    ("allowmedia", "Exempt a member's media from removal"),
+    ("revokemedia", "Withdraw a member's media exemption"),
+    ("allowlist", "List members with exemptions"),
+    ("lock", "Lock a content type (files, videos, links...)"),
+    ("unlock", "Unlock a content type"),
+    ("locks", "Show content locks"),
+    ("block", "Add words or phrases to the blocklist"),
+    ("unblock", "Remove a blocklist entry"),
+    ("blocklist", "Show the blocklist"),
+    ("ban", "Ban a member"),
+    ("dban", "Ban a member and delete their message"),
+    ("unban", "Lift a ban"),
+    ("kick", "Remove a member from the chat"),
+    ("dkick", "Remove a member and delete their message"),
+    ("mute", "Mute a member"),
+    ("dmute", "Mute a member and delete their message"),
+    ("unmute", "Lift a mute"),
+    ("warn", "Warn a member"),
+    ("dwarn", "Warn a member and delete their message"),
+    ("unwarn", "Withdraw the latest warning"),
+    ("clearwarns", "Reset a member's warnings"),
+    ("warns", "Show a member's warnings"),
+    ("whois", "Show a member's profile"),
     ("del", "Delete the replied message"),
-    ("purge", "Delete messages from the replied one down"),
+    ("purge", "Bulk-delete recent messages"),
+    ("purgeuser", "Delete a member's recent messages"),
     ("pin", "Pin the replied message"),
     ("unpin", "Unpin a message"),
-    ("setwelcome", "Set the welcome message"),
-    ("welcome", "Turn welcome messages on or off"),
-    ("setrules", "Set the group rules"),
-    ("rules", "Show the group rules"),
+    ("setwelcome", "Set the greeting for new members"),
+    ("welcome", "Toggle the greeting"),
+    ("setrules", "Publish chat rules"),
+    ("rules", "Show chat rules"),
     ("id", "Show chat and user IDs"),
-    ("help", "Show all commands"),
+    ("help", "Browse all commands"),
 ]
 MEMBER_COMMANDS = [
-    ("rules", "Show the group rules"),
-    ("report", "Report a message to the admins"),
+    ("rules", "Show chat rules"),
+    ("report", "Flag a message for the admins"),
     ("warns", "Check your warnings"),
     ("id", "Show chat and user IDs"),
-    ("help", "Show all commands"),
+    ("help", "Browse all commands"),
 ]
-PRIVATE_COMMANDS = [("start", "Start the bot"), ("help", "Show all commands")]
+PRIVATE_COMMANDS = [("start", "Get started"), ("help", "Browse all commands")]
 
 
 async def post_init(app: Application):
@@ -1383,38 +1676,54 @@ def main():
         raise SystemExit("Set the BOT_TOKEN environment variable (get one from @BotFather).")
     app = Application.builder().token(token).post_init(post_init).build()
 
-    app.add_handler(TypeHandler(Update, track_user), group=-1)
+    app.add_handler(TypeHandler(Update, track), group=-1)
     groups = filters.ChatType.GROUPS
     # Must be first: every edited message (including edited commands) goes here.
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & groups, on_edit))
 
+    # First name in each tuple is the public one; the rest are legacy aliases.
     commands = {
         ("start", "help"): cmd_help,
-        ("settings",): cmd_settings,
+        ("settings", "panel"): cmd_settings,
         ("editdelay", "set_delay", "setdelay"): cmd_editdelay,
         ("mediadelay", "set_delaymedia", "setdelaymedia"): cmd_mediadelay,
         ("nsfw",): cmd_nsfw,
-        ("auth",): _auth_command("edit", True, "✅ {} may now edit messages."),
-        ("unauth",): _auth_command("edit", False, "✅ {} may no longer edit messages."),
-        ("authmedia", "auth_media"): _auth_command(
-            "media", True, "✅ {}'s media is now exempt from deletion."
+        ("allowedit", "auth"): _auth_command(
+            "edit", True, "<b>Exemption granted.</b>\n{} can now edit messages freely."
         ),
-        ("unauthmedia", "unauth_media"): _auth_command(
-            "media", False, "✅ {}'s media is no longer exempt."
+        ("revokeedit", "unauth"): _auth_command(
+            "edit", False, "<b>Exemption withdrawn.</b>\n{}'s edits will be removed again."
         ),
-        ("authlist",): cmd_authlist,
-        ("ban",): cmd_ban,
+        ("allowmedia", "authmedia", "auth_media"): _auth_command(
+            "media", True, "<b>Exemption granted.</b>\nI'll leave {}'s media untouched."
+        ),
+        ("revokemedia", "unauthmedia", "unauth_media"): _auth_command(
+            "media", False, "<b>Exemption withdrawn.</b>\n{}'s media follows the chat rules again."
+        ),
+        ("allowlist", "authlist"): cmd_allowlist,
+        ("lock",): _lock_command(1),
+        ("unlock",): _lock_command(0),
+        ("locks",): cmd_locks,
+        ("block",): cmd_block,
+        ("unblock",): cmd_unblock,
+        ("blocklist",): cmd_blocklist,
+        ("ban",): _mod_command(_ban),
+        ("dban",): _mod_command(_ban, also_delete=True),
         ("unban",): cmd_unban,
-        ("kick",): cmd_kick,
-        ("mute",): cmd_mute,
+        ("kick",): _mod_command(_kick),
+        ("dkick",): _mod_command(_kick, also_delete=True),
+        ("mute",): _mod_command(_mute),
+        ("dmute",): _mod_command(_mute, also_delete=True),
         ("unmute",): cmd_unmute,
-        ("warn",): cmd_warn,
+        ("warn",): _mod_command(_warn),
+        ("dwarn",): _mod_command(_warn, also_delete=True),
         ("unwarn",): cmd_unwarn,
-        ("resetwarns",): cmd_resetwarns,
+        ("clearwarns", "resetwarns"): cmd_clearwarns,
         ("warns",): cmd_warns,
-        ("info",): cmd_info,
+        ("whois", "info"): cmd_whois,
         ("del",): cmd_del,
         ("purge",): cmd_purge,
+        ("purgeuser",): cmd_purgeuser,
         ("pin",): cmd_pin,
         ("unpin",): cmd_unpin,
         ("setwelcome",): cmd_setwelcome,
