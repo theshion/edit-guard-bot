@@ -1,3 +1,2 @@
 python-telegram-bot[job-queue]==21.10
 nudenet==3.4.2
-anthropic==2.9.0
