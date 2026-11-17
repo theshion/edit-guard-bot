@@ -10,6 +10,8 @@ Telegram groups ke liye automated protection aur moderation bot.
 - **Moderation** — ban, kick, mute, warn (limit par automatic penalty), delete-with-action variants
 - **Cleanup** — purge, per-user purge, join/leave notices aur bot ke apne notices auto-hide
 - **Reports** — member `/report` kare to admins ko action buttons milte hain
+- **AI assistant** — admin seedhi bhasha mein bole ("ye banda spam kar raha hai, dekh lo") aur bot khud action le
+- **Saaf chat** — bot ke apne messages 1 minute baad khud hat jaate hain
 - **Control panel** — `/settings` se sab kuch inline buttons se
 - **"/" menu** — admins ko poori command list, members ko chhoti list
 
@@ -22,6 +24,7 @@ Jahan user chunna ho: uske message par reply karo, ya user ID / `@username` likh
 | Command | Kaam |
 | --- | --- |
 | `/settings` | Control panel |
+| `/ask <baat>` | AI assistant se seedhi bhasha mein kaam karwao (ya bot ko mention / reply karo) |
 | `/editdelay 2m` | Edited message itni der baad hatega (`off` = turant) |
 | `/mediadelay 10m` | Media itni der baad hatega (`off` = band) |
 | `/nsfw on` / `off` | Explicit-media filter |
@@ -98,6 +101,22 @@ Naya code aane par update:
 ./update.sh
 ```
 
+## AI assistant (optional)
+
+Admins bot ko mention karke, uske message par reply karke, ya `/ask` se seedhi bhasha mein bol sakte hain. Assistant warn / mute / ban / kick, message delete, member ke messages saaf, content lock, blocklist aur settings badal sakta hai. Sirf admins ki sunta hai aur admins par action nahi leta.
+
+Chalu karne ke liye [console.anthropic.com](https://console.anthropic.com) se API key lo aur server par repo folder mein `.env` file banao:
+
+```bash
+echo 'ANTHROPIC_API_KEY=sk-ant-...' >> .env
+```
+
+```bash
+./update.sh
+```
+
+Har request ka API kharcha lagta hai. Sasta model chahiye to `.env` mein `AI_MODEL=claude-haiku-5-5` jod do.
+
 ## Environment variables
 
 | Variable | Default | Matlab |
@@ -105,10 +124,13 @@ Naya code aane par update:
 | `BOT_TOKEN` | — | BotFather ka token (zaroori) |
 | `DB_PATH` | `bot.db` | SQLite file ka path |
 | `NSFW_THRESHOLD` | `0.5` | Filter ki sensitivity (kam = zyada strict) |
+| `ANTHROPIC_API_KEY` | — | AI assistant ke liye (na ho to assistant band) |
+| `AI_MODEL` | `claude-opus-5-5` | Assistant ka model |
 
 ## Notes
 
 - Settings, warnings, blocklist aur pending deletions SQLite mein save hote hain; restart ke baad bhi timers chalte rehte hain.
+- Bot ke apne messages 1 minute baad hat jaate hain (panel, help aur AI ke jawab 5 minute). Samay `/settings` → Housekeeping se badlo; report cards tab tak rehte hain jab tak admin action na le.
 - `/purgeuser` sirf wahi messages hata sakta hai jo bot ne pichhle 48 ghante mein dekhe hain.
 - Explicit-media detection [NudeNet](https://github.com/notAI-tech/NudeNet) se locally hota hai. Video / GIF / animated sticker ka thumbnail scan hota hai, isliye detection 100% perfect nahi hai.
 - Bot copyrighted content ko khud nahi pehchaan sakta; locks aur blocklist se aap tay karte ho kya rokna hai.
